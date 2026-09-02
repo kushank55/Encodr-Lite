@@ -27,7 +27,36 @@ import { z } from "zod";
  *     chain more than one refine, each with its own message.
  *   - Write the test for this FIRST — see __tests__/example.test.ts for the pattern.
  */
-export const sourceUrlSchema = z.string().min(1, "Source URL is required");
+export const sourceUrlSchema = z.string().min(1, "Source URL is required").superRefine((value, ctx) => {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    ctx.addIssue({
+      code: "custom",
+      message: "Enter a valid URL, e.g. https://cdn.example.com/videos/clip.mp4",
+    });
+    return;
+  }
+
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
+    ctx.addIssue({
+      code: "custom",
+      message: "Only http and https URLs are supported",
+    });
+    return;
+  }
+
+  // Host-only URLs parse with pathname "/". Strip trailing slashes so
+  // https://cdn.example.com and https://cdn.example.com/ both fail.
+  const path = url.pathname.replace(/\/+$/, "");
+  if (!path) {
+    ctx.addIssue({
+      code: "custom",
+      message: "URL must include a file path, e.g. /videos/clip.mp4",
+    });
+  }
+});
 
 export const createJobSchema = z.object({
   sourceUrl: sourceUrlSchema,
