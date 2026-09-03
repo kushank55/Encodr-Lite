@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { TIMELINE, type EncodeResult, type EncodeRun, type Job, type JobStatus } from "@/lib/types";
+import {
+  TIMELINE,
+  type EncodeResult,
+  type EncodeRun,
+  type Job,
+  type JobStatus,
+  type Stage,
+} from "@/lib/types";
 
 // Our "database" is two Maps held in memory. `next dev` is a single Node process, so this is fine
 // for the exercise. Restarting the dev server wipes everything — that's expected, don't work around it.
@@ -53,7 +60,53 @@ export const FAIL_URL = "https://cdn.example.com/videos/corrupt.mp4";
  * the failing URL), watch them fail, then make them pass.
  */
 export function computeRun(record: RunRecord, now: number = Date.now()): EncodeRun {
-  throw new Error("Not implemented: computeRun (see TODO above)");
+  const elapsed = Math.max(0, now - record.startedAt);
+  const fails = record.sourceUrl === FAIL_URL && elapsed >= TIMELINE.failAtMs;
+
+  let stage: Stage;
+  if (fails) {
+    stage = "FAILED";
+  } else if (elapsed < TIMELINE.queuedEndsMs) {
+    stage = "QUEUED";
+  } else if (elapsed < TIMELINE.downloadingEndsMs) {
+    stage = "DOWNLOADING";
+  } else if (elapsed < TIMELINE.transcodingEndsMs) {
+    stage = "TRANSCODING";
+  } else {
+    stage = "COMPLETED";
+  }
+
+  // Scale across the full 12s timeline. A failed run freezes at the moment it failed
+  // so the bar never jumps forward (or back) after the error.
+  const progressMs = fails ? TIMELINE.failAtMs : Math.min(elapsed, TIMELINE.transcodingEndsMs);
+  const progressPct = Math.round((progressMs / TIMELINE.transcodingEndsMs) * 100);
+
+  return {
+    id: record.id,
+    jobId: record.jobId,
+    stage,
+    progressPct,
+    message: messageFor(stage),
+    ...(stage === "FAILED"
+      ? { error: "The source file looks corrupt and could not be transcoded." }
+      : {}),
+    ...(stage === "COMPLETED" ? { result: makeResult() } : {}),
+  };
+}
+
+function messageFor(stage: Stage): string {
+  switch (stage) {
+    case "QUEUED":
+      return "Waiting in queue…";
+    case "DOWNLOADING":
+      return "Downloading source…";
+    case "TRANSCODING":
+      return "Transcoding 1080p…";
+    case "COMPLETED":
+      return "Encode complete.";
+    case "FAILED":
+      return "Encode failed.";
+  }
 }
 
 // ---------------------------------------------------------------------------
