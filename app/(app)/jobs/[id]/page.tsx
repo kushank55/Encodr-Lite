@@ -1,41 +1,13 @@
 "use client";
 
-import { use } from "react";
+import { use, useState } from "react";
 import Link from "next/link";
-import { useJob } from "@/lib/client/hooks";
+import { useJob, useStartRun } from "@/lib/client/hooks";
+import { useRunPolling } from "@/lib/client/use-run-polling";
 import { StatusBadge } from "@/components/status-badge";
+import { ProgressBar } from "@/components/progress-bar";
+import type { EncodeRun, Job } from "@/lib/types";
 
-// The header (title, source URL, status badge, loading and not-found states) is provided.
-//
-// ---------------------------------------------------------------------------
-// TASK 5 — TODO(candidate): build the run panel where the placeholder is.
-// ---------------------------------------------------------------------------
-//
-// This is the most substantial screen in the exercise. Build it in this order:
-//
-//   1. A "Start encode" button that calls the provided useStartRun(job.id) mutation and keeps
-//      the returned `runId` in state. Disable it while a run is in flight.
-//
-//   2. Live progress, driven by your useRunPolling(runId) hook:
-//        - the current stage (<StatusBadge value={run.stage} />),
-//        - a percentage bar (<ProgressBar value={run.progressPct} />),
-//        - the log — the messages collected so far, newest last.
-//      A run takes about 12 seconds, so you'll see the whole thing without waiting long.
-//
-//   3. The FAILED case. Create a job with the source URL
-//        https://cdn.example.com/videos/corrupt.mp4
-//      and it will fail partway. Show the error message clearly (a red panel, `failed` on the
-//      progress bar) and offer a Retry that starts a fresh run.
-//
-//   4. The COMPLETED case. `run.result` arrives with the final poll: show the duration and a
-//      small table of renditions (label / resolution / size). Plain and readable beats fancy.
-//
-// A note on state: at any moment this screen is in exactly one of — idle, running, failed,
-// completed. Try to make that explicit in how you write it, rather than juggling several
-// booleans that could contradict each other (`isRunning && isFailed` should be impossible to
-// express, not merely unlikely). Say what you chose in the README.
-//
-// We are NOT grading visual design. Correct behaviour and readable code are what count.
 export default function JobDetailPage({ params }: { params: Promise<{ id: string }> }) {
   const { id } = use(params);
   const jobQuery = useJob(id);
@@ -55,7 +27,40 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
     );
   }
 
-  const job = jobQuery.data;
+  return (
+    <JobDetail
+      job={jobQuery.data}
+      onRunFinished={() => {
+        void jobQuery.refetch();
+      }}
+    />
+  );
+}
+
+/**
+ * The detail screen is in exactly one of these views, derived from the latest run:
+ * idle (never started) | running | failed | completed.
+ */
+type RunView = "idle" | "running" | "failed" | "completed";
+
+function viewFor(run: EncodeRun | null, runId: string | null): RunView {
+  if (!runId) return "idle";
+  if (run?.stage === "COMPLETED") return "completed";
+  if (run?.stage === "FAILED") return "failed";
+  return "running";
+}
+
+function JobDetail({ job, onRunFinished }: { job: Job; onRunFinished: () => void }) {
+  const start = useStartRun(job.id);
+  const [startedRunId, setStartedRunId] = useState<string | null>(null);
+  const runId = startedRunId ?? job.latestRunId ?? null;
+  const polling = useRunPolling(runId, onRunFinished);
+  const view = viewFor(polling.run, runId);
+
+  async function beginRun() {
+    const { runId: nextId } = await start.mutateAsync();
+    setStartedRunId(nextId);
+  }
 
   return (
     <div className="space-y-6">
@@ -71,10 +76,147 @@ export default function JobDetailPage({ params }: { params: Promise<{ id: string
         <StatusBadge value={job.status} />
       </div>
 
-      <p className="rounded-md border border-dashed border-neutral-300 p-4 text-sm text-neutral-500">
-        TODO(candidate): Start encode button, live progress, log, failure + retry, and the results
-        table.
+      {view === "idle" && (
+        <StartButton
+          busy={start.isPending}
+          onClick={beginRun}
+          error={start.error instanceof Error ? start.error.message : null}
+        />
+      )}
+
+      {view === "running" && (
+        <RunProgress run={polling.run} log={polling.log} fetchError={polling.fetchError} />
+      )}
+
+      {view === "failed" && polling.run && (
+        <div className="space-y-4">
+          <RunProgress run={polling.run} log={polling.log} fetchError={polling.fetchError} failed />
+          <div className="rounded-md border border-red-200 bg-red-50 p-4 text-sm text-red-800">
+            <p className="font-medium">Encode failed</p>
+            <p className="mt-1">{polling.run.error ?? "The run stopped before it finished."}</p>
+          </div>
+          <StartButton
+            busy={start.isPending}
+            onClick={beginRun}
+            label="Retry"
+            error={start.error instanceof Error ? start.error.message : null}
+          />
+        </div>
+      )}
+
+      {view === "completed" && polling.run?.result && (
+        <div className="space-y-4">
+          <RunProgress run={polling.run} log={polling.log} fetchError={polling.fetchError} />
+          <RenditionsTable
+            durationSec={polling.run.result.durationSec}
+            renditions={polling.run.result.renditions}
+          />
+        </div>
+      )}
+    </div>
+  );
+}
+
+function StartButton({
+  busy,
+  onClick,
+  label = "Start encode",
+  error,
+}: {
+  busy: boolean;
+  onClick: () => Promise<void>;
+  label?: string;
+  error: string | null;
+}) {
+  return (
+    <div className="space-y-2">
+      <button
+        type="button"
+        disabled={busy}
+        onClick={() => void onClick()}
+        className="rounded-md bg-blue-600 px-4 py-2 text-sm font-medium text-white hover:bg-blue-700 disabled:opacity-50"
+      >
+        {busy ? "Starting…" : label}
+      </button>
+      {error && (
+        <p role="alert" className="text-sm text-red-600">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function RunProgress({
+  run,
+  log,
+  fetchError,
+  failed,
+}: {
+  run: EncodeRun | null;
+  log: string[];
+  fetchError: string | null;
+  failed?: boolean;
+}) {
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        {run ? <StatusBadge value={run.stage} /> : <span className="text-sm text-neutral-500">Starting…</span>}
+        <span className="text-sm tabular-nums text-neutral-500">{run ? `${run.progressPct}%` : "—"}</span>
+      </div>
+      <ProgressBar value={run?.progressPct ?? 0} failed={failed || run?.stage === "FAILED"} />
+      {log.length > 0 && (
+        <ol className="space-y-1 rounded-md border border-neutral-200 bg-white p-3 font-mono text-xs text-neutral-700">
+          {log.map((line, i) => (
+            <li key={`${i}-${line}`}>{line}</li>
+          ))}
+        </ol>
+      )}
+      {fetchError && (
+        <p role="alert" className="text-sm text-red-600">
+          {fetchError}
+        </p>
+      )}
+    </div>
+  );
+}
+
+function RenditionsTable({
+  durationSec,
+  renditions,
+}: {
+  durationSec: number;
+  renditions: NonNullable<EncodeRun["result"]>["renditions"];
+}) {
+  const minutes = Math.floor(durationSec / 60);
+  const seconds = durationSec % 60;
+
+  return (
+    <div className="space-y-2">
+      <h2 className="text-sm font-medium">Output</h2>
+      <p className="text-sm text-neutral-500">
+        Duration {minutes}:{String(seconds).padStart(2, "0")}
       </p>
+      <table className="w-full text-left text-sm">
+        <thead>
+          <tr className="border-b border-neutral-200 text-neutral-500">
+            <th className="py-2 pr-3 font-medium">Rendition</th>
+            <th className="py-2 pr-3 font-medium">Resolution</th>
+            <th className="py-2 font-medium">Size</th>
+          </tr>
+        </thead>
+        <tbody>
+          {renditions.map((r) => (
+            <tr key={r.label} className="border-b border-neutral-100">
+              <td className="py-2 pr-3">{r.label}</td>
+              <td className="py-2 pr-3">
+                {r.width}×{r.height}
+              </td>
+              <td className="py-2">{r.sizeMb} MB</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
